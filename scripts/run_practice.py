@@ -4,7 +4,7 @@
     python3 scripts/run_practice.py                  # mock, 8 brief công khai
     python3 scripts/run_practice.py --brief pub-01-sla-hien-hanh
     python3 scripts/run_practice.py --layers none    # baseline, không lớp nào
-    python3 scripts/run_practice.py --model real     # cần ARENA_* trong env
+    python3 scripts/run_practice.py --model real     # cần GEMINI_API_KEY trong env
 
 Kết quả in ra màn hình VÀ ghi vào một file điểm JSON (mặc định
 `runs/practice.json`) — file đó là thứ `scripts/leaderboard.py` đọc.
@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import statistics
 import sys
 import time
@@ -61,13 +62,52 @@ LAB_ROOT = Path(__file__).resolve().parent.parent
 if str(LAB_ROOT) not in sys.path:
     sys.path.insert(0, str(LAB_ROOT))
 
+
+def _load_env() -> None:
+    """Tải biến từ file .env nếu có (không cần python-dotenv)."""
+    env_path = LAB_ROOT / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env()
+
+
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite"
+
+
+def _configure_gemini() -> None:
+    """Ánh xạ cấu hình Gemini sang giao diện endpoint chung của Arena."""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return
+    os.environ["ARENA_API_KEY"] = api_key
+    os.environ["ARENA_MODEL"] = (
+        os.environ.get("GEMINI_MODEL", GEMINI_DEFAULT_MODEL).strip()
+        or GEMINI_DEFAULT_MODEL
+    )
+
+
+_configure_gemini()
+
 from arena.briefs import (  # noqa: E402
     PUBLIC_BRIEFS_PATH,
     load_briefs,
     load_public_briefs,
 )
 from arena.corpus import Corpus  # noqa: E402
-from arena.model import MockModel, RealModel, RealModelError  # noqa: E402
+from arena.model import MockModel, ModelResponse, RealModelError  # noqa: E402
 from arena.runner import (  # noqa: E402
     RUNNER_VERSION,
     PreflightError,
@@ -125,11 +165,186 @@ def build_middleware(spec: str):
     return _student_layers(names), [name for name in STACK_ORDER if name in names]
 
 
-def build_model(kind: str, corpus: Corpus, seed: int, timeout: float):
+class RetryingRealModel:
+    """Retry hữu hạn cho lỗi HTTP tạm thời của model thật.
+
+    Retry nằm bên trong model adapter nên runner chỉ ghi một ``model_call`` khi
+    endpoint thực sự trả lời; không có output giả hoặc fallback sang mock.
+    """
+
+    RETRYABLE_MARKERS = tuple(
+        f"HTTP Error {status}" for status in (408, 429, 500, 502, 503, 504)
+    )
+    DAILY_LIMIT_MARKERS = ("tokens per day", "requests per day", "(TPD)", "(RPD)")
+
+    def __init__(self, inner, *, max_retries: int = 4, base_delay: float = 2.0):
+        self.inner = inner
+        self.max_retries = max(0, max_retries)
+        self.base_delay = max(0.0, base_delay)
+
+    def complete(self, messages: list[dict], **kwargs):
+        for retry_index in range(self.max_retries + 1):
+            try:
+                return self.inner.complete(messages, **kwargs)
+            except RealModelError as exc:
+                error_text = str(exc)
+                retryable = (
+                    any(marker in error_text for marker in self.RETRYABLE_MARKERS)
+                    and not any(
+                        marker.lower() in error_text.lower()
+                        for marker in self.DAILY_LIMIT_MARKERS
+                    )
+                )
+                if not retryable or retry_index >= self.max_retries:
+                    raise
+                delay = min(self.base_delay * (2 ** retry_index), 60.0)
+                delay += random.uniform(0.0, max(0.1, delay * 0.2))
+                print(
+                    f"[{getattr(self.inner, 'provider', 'model')}] lỗi tạm thời; "
+                    f"thử lại {retry_index + 1}/"
+                    f"{self.max_retries} sau {delay:.1f}s ({exc})",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+
+
+class GeminiSdkModel:
+    """Gemini native chat; SDK giữ thought signatures giữa các lượt."""
+
+    provider = "gemini"
+
+    def __init__(self, *, api_key: str, model: str, timeout: float):
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:
+            raise RealModelError(
+                "Chưa cài Google Gen AI SDK. "
+                "Chạy: python -m pip install -r requirements.txt"
+            ) from exc
+        self.model = model
+        self._types = types
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=int(timeout * 1000)),
+        )
+        self._chat = None
+
+    @staticmethod
+    def _token_count(value, fallback_text: str) -> int:
+        if isinstance(value, int) and value > 0:
+            return value
+        return max(1, len(fallback_text) // 4)
+
+    def complete(self, messages: list[dict], **kwargs) -> ModelResponse:
+        max_output_tokens = kwargs.get("max_tokens", 1024)
+        if self._chat is None:
+            system_instruction = "\n\n".join(
+                str(message.get("content", ""))
+                for message in messages
+                if message.get("role") == "system"
+            )
+            self._chat = self.client.chats.create(
+                model=self.model,
+                config=self._types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    max_output_tokens=max_output_tokens,
+                    thinking_config=self._types.ThinkingConfig(
+                        thinking_level="minimal"
+                    ),
+                ),
+            )
+
+        # Chat giữ response gốc cùng thought signature. Chỉ chuyển phần user
+        # mới nhất từ harness: observation của tool và nudge tạm thời.
+        last_assistant = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if message.get("role") == "assistant"
+            ),
+            default=-1,
+        )
+        user_text = "\n\n".join(
+            str(message.get("content", ""))
+            for message in messages[last_assistant + 1 :]
+            if message.get("role") == "user"
+        )
+
+        try:
+            response = self._chat.send_message(
+                user_text,
+                config=self._types.GenerateContentConfig(
+                    max_output_tokens=max_output_tokens,
+                    thinking_config=self._types.ThinkingConfig(
+                        thinking_level="minimal"
+                    ),
+                ),
+            )
+        except Exception as exc:
+            status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+            status_text = f"HTTP Error {status}: " if isinstance(status, int) else ""
+            raise RealModelError(
+                f"Gọi Gemini thất bại: {status_text}{exc}. "
+                "Không có phương án dự phòng nào được dùng thay thế."
+            ) from exc
+
+        text = getattr(response, "text", None)
+        usage = getattr(response, "usage_metadata", None)
+        if not isinstance(text, str):
+            candidates = getattr(response, "candidates", None) or []
+            finish_reason = (
+                getattr(candidates[0], "finish_reason", None) if candidates else None
+            )
+            raise RealModelError(
+                "Gemini không trả về text "
+                f"(finish_reason={finish_reason!r}, "
+                "output_tokens="
+                f"{getattr(usage, 'candidates_token_count', None)!r}, "
+                "thought_tokens="
+                f"{getattr(usage, 'thoughts_token_count', None)!r})."
+            )
+
+        conversation = "\n".join(str(message.get("content", "")) for message in messages)
+        output_tokens = getattr(usage, "candidates_token_count", None)
+        thought_tokens = getattr(usage, "thoughts_token_count", None)
+        completion_tokens = (
+            (output_tokens if isinstance(output_tokens, int) else 0)
+            + (thought_tokens if isinstance(thought_tokens, int) else 0)
+        )
+        return ModelResponse(
+            text=text,
+            prompt_tokens=self._token_count(
+                getattr(usage, "prompt_token_count", None), conversation
+            ),
+            completion_tokens=self._token_count(completion_tokens, text),
+        )
+
+
+def build_model(
+    kind: str,
+    corpus: Corpus,
+    seed: int,
+    timeout: float,
+    model_retries: int = 4,
+    retry_base_seconds: float = 2.0,
+):
     if kind == "mock":
         return MockModel(corpus=corpus, seed=seed)
     try:
-        return RealModel.from_env(timeout=timeout)
+        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            raise RealModelError("Thiếu GEMINI_API_KEY trong file .env.")
+        real = GeminiSdkModel(
+            api_key=api_key,
+            model=os.environ.get("GEMINI_MODEL", GEMINI_DEFAULT_MODEL),
+            timeout=timeout,
+        )
+        return RetryingRealModel(
+            real,
+            max_retries=model_retries,
+            base_delay=retry_base_seconds,
+        )
     except RealModelError as exc:
         raise SystemExit(f"\n{exc}\n")
 
@@ -297,6 +512,10 @@ def main(argv=None) -> int:
                         help="public | đường dẫn tới một file brief bạn tự viết")
     parser.add_argument("--brief", default=None, help="chỉ chạy một brief_id")
     parser.add_argument("--model", default="mock", choices=("mock", "real"))
+    parser.add_argument("--model-retries", type=int, default=4,
+                        help="số lần retry lỗi 429/5xx của model thật (mặc định: 4)")
+    parser.add_argument("--retry-base-seconds", type=float, default=2.0,
+                        help="thời gian chờ gốc cho exponential backoff (mặc định: 2s)")
     parser.add_argument("--layers", default="all",
                         help='"all", "none", hoặc "critic,retry"')
     parser.add_argument("--seed", type=int, default=11, help="seed gốc (mỗi brief +1)")
@@ -356,12 +575,22 @@ def main(argv=None) -> int:
     for index, brief in enumerate(briefs):
         seed = derive_seed(args.seed, index)
         layers, _ = build_middleware(args.layers)
-        model = build_model(args.model, corpus, seed, timeout=60.0)
+        model = build_model(
+            args.model,
+            corpus,
+            seed,
+            timeout=60.0,
+            model_retries=args.model_retries,
+            retry_base_seconds=args.retry_base_seconds,
+        )
         result = run_brief(
             brief, model=model, corpus=corpus, middleware=layers, seed=seed, config=config
         )
         results.append(result)
         score = score_result(result, brief, corpus)
+        # Tránh rate limit khi dùng model thật
+        if args.model == "real" and index < len(briefs) - 1:
+            time.sleep(5)
         rows.append(
             {
                 "brief_id": result.brief_id,

@@ -49,6 +49,26 @@ Không cần mạng, không cần API key.
 python3 scripts/verify.py
 ```
 
+Để chạy Gemini 3.5 Flash-Lite, điền khóa vào file `.env` (file này đã được
+`.gitignore`):
+
+```dotenv
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_MODEL=gemini-3.5-flash-lite
+```
+
+Sau đó chạy:
+
+```bash
+python3 scripts/run_practice.py --model real
+```
+
+Đường chạy này dùng Google Gen AI SDK với native chat session và model
+`gemini-3.5-flash-lite`. Có thể đặt `GEMINI_MODEL` trong `.env` để ghi đè.
+Khi provider trả về lỗi tạm thời `429`
+hoặc `5xx`, script tự thử lại tối đa 4 lần với exponential backoff. Có thể điều
+chỉnh retry bằng `--model-retries` và `--retry-base-seconds`.
+
 ---
 
 ## 3. Phần của bạn và phần đóng băng

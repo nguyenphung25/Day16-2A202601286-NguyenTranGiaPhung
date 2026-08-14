@@ -78,17 +78,73 @@ class Critic(Middleware):
 
     name = "critic"
 
+    @staticmethod
+    def _source_for(ctx, text: str, *, exclude: str | None = None):
+        if ctx.corpus is None or not text:
+            return None
+        for doc in ctx.corpus.docs:
+            if doc.doc_id == exclude or doc.body not in ctx.observed_text:
+                continue
+            if any(text in line for line in doc.body.splitlines()):
+                return doc
+        return None
+
+    def _split_fused_claim(self, ctx, claim: dict) -> list[dict] | None:
+        text = claim.get("text")
+        if not isinstance(text, str):
+            return None
+        separator = " và "
+        offset = 0
+        while True:
+            split_at = text.find(separator, offset)
+            if split_at == -1:
+                return None
+            left = text[:split_at].strip()
+            right = text[split_at + len(separator):].strip()
+            left_doc = self._source_for(ctx, left)
+            right_doc = self._source_for(
+                ctx, right, exclude=left_doc.doc_id if left_doc else None
+            )
+            if left_doc is not None and right_doc is not None:
+                return [
+                    {**claim, "text": left, "doc_id": left_doc.doc_id},
+                    {**claim, "text": right, "doc_id": right_doc.doc_id},
+                ]
+            # Separators may overlap when the first source itself ends in
+            # "và": `<left> và` + ` và ` + `<right>` becomes "và và".
+            offset = split_at + 1
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        grounded = []
+        split_any = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if isinstance(text, str) and ctx.saw(text):
+                grounded.append(claim)
+                continue
+            split = self._split_fused_claim(ctx, claim)
+            if split is not None:
+                grounded.extend(split)
+                split_any = True
+
+        report["claims"] = grounded
+        report["citations"] = sorted(
+            {
+                claim.get("doc_id")
+                for claim in grounded
+                if isinstance(claim.get("doc_id"), str) and claim.get("doc_id")
+            }
+        )
+        if split_any:
+            report["abstain"] = True
+        if not grounded:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ từ các tài liệu đã quan sát để trả lời."
+        return report

@@ -5,8 +5,5 @@
 # able to compete on the mock model.
 pytest>=8.0,<9.0
 
-# Real-provider path (optional, NOT required to compete): uncomment if
-# you want to point the harness at a live model instead of arena's
-# mock. Pin whichever SDK matches the provider you use.
-# anthropic>=0.40,<1.0
-# openai>=1.50,<2.0
+# Gemini native chat path used by `scripts/run_practice.py --model real`.
+google-genai>=1.0,<2.0

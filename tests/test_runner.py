@@ -1320,12 +1320,18 @@ def test_run_practice_refuses_the_real_path_without_credentials():
     proc = subprocess.run(
         [sys.executable, "scripts/run_practice.py", "--model", "real", "--brief",
          "pub-01-sla-hien-hanh"],
-        capture_output=True, text=True, cwd=str(LAB_ROOT), env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        cwd=str(LAB_ROOT),
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONIOENCODING": "utf-8",
+            "GEMINI_API_KEY": "",
+        },
     )
     assert proc.returncode != 0
     combined = proc.stdout + proc.stderr
-    assert "ARENA_API_KEY" in combined
-    assert "ARENA_BASE_URL" in combined
+    assert "GEMINI_API_KEY" in combined
 
 
 def test_verify_exits_zero_on_a_clean_checkout():
