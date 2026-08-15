@@ -45,6 +45,10 @@ import json
 import sys
 from pathlib import Path
 
+# Ensure UTF-8 output on Windows (cp1252 can't encode ✔/✘/⚠)
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+
 LAB_ROOT = Path(__file__).resolve().parent.parent
 if str(LAB_ROOT) not in sys.path:
     sys.path.insert(0, str(LAB_ROOT))

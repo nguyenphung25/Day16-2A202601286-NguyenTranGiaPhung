@@ -1,0 +1,6 @@
+# Force LF for frozen arena files so MD5 checksums match
+arena/trace.py text eol=lf
+arena/corpus.py text eol=lf
+arena/tools.py text eol=lf
+arena/model.py text eol=lf
+arena/scorer.py text eol=lf

@@ -177,7 +177,7 @@ class RetryingRealModel:
     )
     DAILY_LIMIT_MARKERS = ("tokens per day", "requests per day", "(TPD)", "(RPD)")
 
-    def __init__(self, inner, *, max_retries: int = 4, base_delay: float = 2.0):
+    def __init__(self, inner, *, max_retries: int = 6, base_delay: float = 8.0):
         self.inner = inner
         self.max_retries = max(0, max_retries)
         self.base_delay = max(0.0, base_delay)
@@ -272,15 +272,7 @@ class GeminiSdkModel:
         )
 
         try:
-            response = self._chat.send_message(
-                user_text,
-                config=self._types.GenerateContentConfig(
-                    max_output_tokens=max_output_tokens,
-                    thinking_config=self._types.ThinkingConfig(
-                        thinking_level="minimal"
-                    ),
-                ),
-            )
+            response = self._chat.send_message(user_text)
         except Exception as exc:
             status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
             status_text = f"HTTP Error {status}: " if isinstance(status, int) else ""
@@ -304,7 +296,6 @@ class GeminiSdkModel:
                 "thought_tokens="
                 f"{getattr(usage, 'thoughts_token_count', None)!r})."
             )
-
         conversation = "\n".join(str(message.get("content", "")) for message in messages)
         output_tokens = getattr(usage, "candidates_token_count", None)
         thought_tokens = getattr(usage, "thoughts_token_count", None)
@@ -579,7 +570,7 @@ def main(argv=None) -> int:
             args.model,
             corpus,
             seed,
-            timeout=60.0,
+            timeout=120.0,
             model_retries=args.model_retries,
             retry_base_seconds=args.retry_base_seconds,
         )
@@ -590,7 +581,7 @@ def main(argv=None) -> int:
         score = score_result(result, brief, corpus)
         # Tránh rate limit khi dùng model thật
         if args.model == "real" and index < len(briefs) - 1:
-            time.sleep(5)
+            time.sleep(30)
         rows.append(
             {
                 "brief_id": result.brief_id,
